@@ -1,0 +1,190 @@
+import torchvision.models as models                           # for example model
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+# first, initialize the FP32 model with pr|etrained parameters.
+# model = models.__dict__["resnet50"](pretrained=True)
+# num_ftrs = model.fc.in_features
+# model.fc = nn.Linear(num_ftrs, 100)
+"""from pytorchcv.model_provider import get_model as ptcv_get_model
+model = ptcv_get_model('resnet50', pretrained=True)
+num_ftrs = model.output.in_features
+model.output = nn.Linear(num_ftrs, 100)
+"""
+from models.resnet_custom import resnet50_baseline
+from torch.utils.checkpoint import checkpoint as ckp
+
+class DummyLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dummy = nn.Parameter(torch.ones(1, dtype=torch.float32))
+    def forward(self,x):
+        return x + self.dummy - self.dummy #(also tried x+self.dummy)
+
+
+class Model(nn.Module):
+    def __init__(self, input_dim=1024):
+        super(Model, self).__init__()
+        self.backbone = resnet50_baseline(True)
+        self.backbone.fc = nn.Linear(1024, 2)
+        self.fc = nn.Linear(1024, 2)
+        self.dummy_layer = DummyLayer()
+
+    def forward(self, x):
+#         _, feat = self.backbone(x)
+#         prob = self.fc(feat)
+        x = self.dummy_layer(x)
+        _, feat = ckp(self.backbone, x)
+        prob = ckp(self.fc, feat)
+        return prob, feat
+
+model = Model(input_dim=1024)
+
+
+def get_training_dataloader(batch_size=128, num_workers=8, shuffle=True):
+    transform_train = transforms.Compose([
+        #transforms.ToPILImage(),
+        # transforms.RandomCrop(32, padding=4),
+        transforms.Resize(256),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(15),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5070751592371323, 0.48654887331495095, 0.4409178433670343], [0.2673342858792401, 0.2564384629170883, 0.27615047132568404])
+    ])
+    #cifar100_training = CIFAR100Train(path, transform=transform_train)
+    cifar100_training = torchvision.datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
+    cifar100_training_loader = DataLoader(
+        cifar100_training, shuffle=shuffle, num_workers=num_workers, batch_size=batch_size, drop_last=True)
+
+    return cifar100_training_loader
+
+def get_test_dataloader(batch_size=128, num_workers=8, shuffle=True):
+    transform_test = transforms.Compose([
+        transforms.Resize(256),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5070751592371323, 0.48654887331495095, 0.4409178433670343], [0.2673342858792401, 0.2564384629170883, 0.27615047132568404])
+    ])
+    #cifar100_test = CIFAR100Test(path, transform=transform_test)
+    cifar100_test = torchvision.datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
+    cifar100_test_loader = DataLoader(
+        cifar100_test, shuffle=shuffle, num_workers=num_workers, batch_size=batch_size, drop_last=True)
+    return cifar100_test_loader
+
+train_loader = get_training_dataloader(
+        num_workers=8,
+        batch_size=128,
+        shuffle=True
+    )
+
+test_loader = get_test_dataloader(
+        num_workers=8,
+        batch_size=128,
+        shuffle=True
+    )
+
+## 一直推理到爆显存
+def train(net, epoch, training_loader, optimizer):
+    import time
+    start = time.time()
+    iter = 0.0
+    #net.train()
+    loss = torch.FloatTensor([0]).cuda()
+    #from tqdm import tqdm
+    for (images, labels) in training_loader:
+        iter+=128
+        print(iter)
+        # print(images.shape)
+        # outputs = net(images.cuda())
+        # loss += nn.CrossEntropyLoss()(outputs, labels.cuda())
+        probs, feature = net(images.cuda())
+        loss += nn.CrossEntropyLoss()(probs, torch.tensor([1 for i in range(128)]).cuda())
+        #optimizer.zero_grad()
+        #loss.backward()
+        #optimizer.step()
+        finish = time.time()
+        print('epoch {} training time consumed: {:.2f}s'.format(epoch, finish - start))
+        if iter==12800:
+            start = time.time()
+            print("loss.backward")
+            print('Training Epoch: {epoch} \tLoss: {:0.4f}'.format(loss.item(),epoch=epoch))
+            optimizer.zero_grad()
+            loss.backward()
+            # print(model.features.stage1.unit2.body.conv1.conv.weight.grad)
+            optimizer.step()
+            loss = torch.FloatTensor([0]).cuda()
+            finish = time.time()
+            print('epoch {} backward time consumed: {:.2f}s'.format(epoch, finish - start))
+
+    
+def evalu(net, epoch, cifar100_test_loader):
+    import time
+    start = time.time()
+    net.eval()
+    test_loss = 0.0 # cost function error
+    correct = 0.0
+
+    from tqdm import tqdm
+    for (images, labels) in tqdm(cifar100_test_loader):
+
+        #if args.gpu:
+        #    images = images.cuda()
+        #    labels = labels.cuda()
+
+        outputs = net(images.cuda().to(torch.float32))
+        loss = nn.CrossEntropyLoss()(outputs, labels.cuda())
+
+        test_loss += loss.item()
+        _, preds = outputs.max(1)
+        correct += preds.eq(labels.cuda()).sum()
+
+    finish = time.time()
+    if True:
+        print('GPU INFO.....')
+        #print(torch.cuda.memory_summary(), end='')
+    print('Evaluating Network.....')
+    print('Test set: Epoch: {}, Average loss: {:.4f}, Accuracy: {:.4f}, Time consumed:{:.2f}s'.format(
+        epoch,
+        test_loss / len(cifar100_test_loader.dataset),
+        correct.float() / len(cifar100_test_loader.dataset),
+        finish - start
+    ))
+    print()
+    return correct.float() / len(cifar100_test_loader.dataset)
+
+from apex import amp
+model.to("cuda")
+model.train()
+para_list = [{"params":[ p for name, p in model.named_parameters() if ("scale" in name)]}]
+optimizer = optim.SGD(para_list, lr=1e-1, momentum=0.9, weight_decay=5e-4)
+model, optimizer = amp.initialize(model, optimizer,opt_level="O1",loss_scale=128.0) 
+# with amp.scale_loss(loss, optimizer) as scaled_loss:
+#     scaled_loss.backward()    
+
+# with amp.scale_loss(loss, optimizer) as scaled_loss:
+#     scaled_loss.backward()
+
+# from torch.utils.checkpoint import checkpoint as ckp
+# from torch.utils.checkpoint import checkpoint_sequential
+# model.train()
+# input_var=torch.randn((1,3,256,256))
+# output_var = checkpoint_sequential(functions=model, segments=4, input=input_var, preserve_rng_state=True)
+
+for name, p in model.named_parameters():
+    p.requires_grad = True
+    
+#     if ("3" in name ) and ("weight_fake_quant.scale" in name):
+#         p.requires_grad = True
+#     else:
+#         p.requires_grad = False
+
+for epoch in range(1, 10):
+    #q_model.eval()
+    #acc = eval(q_model, epoch, test_loader)
+    train(model, epoch, train_loader, optimizer)
+
+print(model)
+for name, p in model.named_parameters():
+    print(name)
